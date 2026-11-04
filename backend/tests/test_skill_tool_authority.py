@@ -1,19 +1,14 @@
-"""Skill allowed-tools is compatibility metadata, not a tool authority.
+"""Skill allowed-tools is assembly-time surface authority when a skill is active.
 
-`allowed-tools` stays parsed, exported, and described, but it must never filter
-model-visible schemas, refuse calls, or rewrite tool_search promotions. Agent
-assembly/execution authorization (provider filtering + Guardrails) owns the
-permission ceiling.
+When slash activation or in-context skill load makes a skill policy-active and
+that skill declares ``allowed-tools``, ``SkillToolPolicyMiddleware`` binds only
+those schemas (plus framework discovery helpers). Guardrails and authorization
+remain a second line for writes and RBAC denials.
 
-These regressions drive the real `build_middlewares` (lead) and
-`build_subagent_runtime_middlewares` chains through `create_agent`, activate a
+These regressions drive the real ``build_middlewares`` (lead) and
+``build_subagent_runtime_middlewares`` chains through ``create_agent``, activate a
 synthetic skill via a real slash command, and assert both model binding and
-actual ToolNode execution on sync and async paths. The synthetic skill lives in
-a real on-disk skills tree served through the configured storage provider, and
-the block under test is taken structurally between the live
-`SkillActivationMiddleware` and `DurableContextMiddleware` anchors, so
-whatever middleware the builder actually installs between those anchors
-reaches `create_agent`.
+actual ToolNode execution on sync and async paths.
 """
 
 from __future__ import annotations
@@ -33,6 +28,7 @@ from pydantic import Field
 from deerflow.agents.lead_agent import agent as lead_agent_module
 from deerflow.agents.middlewares.durable_context_middleware import DurableContextMiddleware
 from deerflow.agents.middlewares.skill_activation_middleware import SkillActivationMiddleware
+from deerflow.agents.middlewares.skill_tool_policy_middleware import SkillToolPolicyMiddleware
 from deerflow.agents.middlewares.tool_error_handling_middleware import build_subagent_runtime_middlewares
 from deerflow.agents.thread_state import ThreadState
 from deerflow.authz.rbac import RbacAuthorizationProvider
@@ -48,6 +44,7 @@ from deerflow.config.token_budget_config import TokenBudgetConfig
 
 _PARSE_CALLS: list[str] = []
 _WRITE_CALLS: list[str] = []
+_DEVICE_CALLS: list[str] = []
 
 
 @tool
@@ -68,6 +65,13 @@ def write_file(path: str, content: str) -> str:
 def read_file(path: str) -> str:
     """Read a file from the skills container."""
     return "file body"
+
+
+@tool
+def control_device(device_id: str, action: str) -> str:
+    """Control an IoT device (not part of meeting workflow)."""
+    _DEVICE_CALLS.append(f"{device_id}:{action}")
+    return "ok"
 
 
 class _RecordingModel(GenericFakeChatModel):
@@ -101,18 +105,13 @@ def _make_app_config(skills_root: Path) -> AppConfig:
         ],
         sandbox=SandboxConfig(use="test"),
         loop_detection=LoopDetectionConfig(enabled=False),
-        # The synthetic skills tree is served through the real configured
-        # storage provider, so every middleware in the block under test
-        # resolves skills through the common production seam.
         skills=SkillsConfig(path=str(skills_root)),
-        # Keep the activation→durable-context block free of unrelated guards.
         safety_finish_reason=SafetyFinishReasonConfig(enabled=False),
         subagents=SubagentsAppConfig(token_budget=TokenBudgetConfig(enabled=False)),
     )
 
 
 def _make_skill(skills_root: Path, name: str, allowed_tools: list[str] | None) -> None:
-    """Write one real custom skill into the per-test skills tree."""
     skill_dir = skills_root / "custom" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -124,7 +123,6 @@ def _make_skill(skills_root: Path, name: str, allowed_tools: list[str] | None) -
     if allowed_tools is None:
         pass
     elif not allowed_tools:
-        # An actual empty YAML sequence, not a null `allowed-tools:` key.
         lines.append("allowed-tools: []")
     else:
         lines.append("allowed-tools:")
@@ -152,32 +150,23 @@ def _subagent_middlewares(app_config: AppConfig) -> list:
 
 
 def _skill_authority_slice(middlewares: list) -> list:
-    """The contiguous skill block the builder installs, taken structurally.
-
-    The block starts at the live ``SkillActivationMiddleware`` anchor and ends
-    just before the live ``DurableContextMiddleware`` anchor — both types
-    exist in every real builder output. Whatever middleware the builder
-    actually places between those anchors is included positionally, so the
-    block stays meaningful against any assembly without recognizing class
-    names that a later revision may delete. Adjacent placement on the current
-    chain is pinned separately by
-    ``test_build_middlewares_orders_skill_activation_before_durable_context``.
-    """
     start = next(i for i, middleware in enumerate(middlewares) if isinstance(middleware, SkillActivationMiddleware))
     end = next(i for i in range(start + 1, len(middlewares)) if isinstance(middlewares[i], DurableContextMiddleware))
     return middlewares[start:end]
 
 
-def _scripted_model() -> _RecordingModel:
+def _scripted_model(*, call_device: bool = False) -> _RecordingModel:
+    tool_name = "control_device" if call_device else "parse_document"
+    tool_args = {"device_id": "lamp-1", "action": "on"} if call_device else {"path": "report.pdf"}
     return _RecordingModel(
         [
             AIMessage(
                 content="",
                 tool_calls=[
                     {
-                        "name": "parse_document",
-                        "args": {"path": "report.pdf"},
-                        "id": "parse-call",
+                        "name": tool_name,
+                        "args": tool_args,
+                        "id": "tool-call-1",
                         "type": "tool_call",
                     }
                 ],
@@ -213,28 +202,80 @@ def _invoke(graph, *, asynchronous: bool) -> tuple[dict, _Journal]:
 
 @pytest.mark.parametrize("builder", ["lead", "subagent"])
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize(
-    "allowed_tools",
-    [["write_file"], [], None],
-    ids=["restrictive", "empty", "omitted"],
-)
-def test_active_skill_allowed_tools_does_not_remove_authorized_tools(monkeypatch, tmp_path, builder, asynchronous, allowed_tools):
-    """A slash-activated skill keeps every already-authorized tool bound and executable.
-
-    allowed-tools is compatibility metadata: restrictive, empty, or omitted
-    declarations must not narrow the Agent's tool set on the lead or Subagent
-    assembly, sync or async. The restrictive case lists only `write_file` while
-    the scripted model executes `parse_document`: an Agent-authorized tool
-    OMITTED by the restrictive metadata must still run.
-    """
-    _make_skill(tmp_path, "demo-skill", allowed_tools)
+def test_active_skill_allowed_tools_filters_unlisted_tools(monkeypatch, tmp_path, builder, asynchronous):
+    """Restrictive allowed-tools hides business tools not declared by the active skill."""
+    allowed = ["write_file"]
+    _make_skill(tmp_path, "demo-skill", allowed)
     app_config = _make_app_config(tmp_path)
-    if builder == "lead":
-        middlewares = _lead_middlewares(monkeypatch, app_config)
-    else:
-        middlewares = _subagent_middlewares(app_config)
+    middlewares = _lead_middlewares(monkeypatch, app_config) if builder == "lead" else _subagent_middlewares(app_config)
     slice_ = _skill_authority_slice(middlewares)
-    assert slice_, "builder must install SkillActivationMiddleware"
+    assert any(isinstance(m, SkillToolPolicyMiddleware) for m in slice_)
+
+    model = _scripted_model()
+    graph = create_agent(
+        model=model,
+        tools=[read_file, parse_document, write_file, control_device],
+        middleware=slice_,
+        state_schema=ThreadState,
+    )
+
+    _PARSE_CALLS.clear()
+    _DEVICE_CALLS.clear()
+    result, journal = _invoke(graph, asynchronous=asynchronous)
+
+    bound = set(model.bound_tool_names[0])
+    assert "parse_document" not in bound
+    assert "control_device" not in bound
+    assert "write_file" in bound
+    assert "read_file" in bound
+    assert _PARSE_CALLS == []
+    assert result["messages"][-1].content == "done"
+    assert [usage.get("name") for usage in journal.skill_usages if isinstance(usage, dict)] == ["demo-skill"]
+
+
+@pytest.mark.parametrize("builder", ["lead", "subagent"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_active_skill_blocks_unlisted_tool_execution(monkeypatch, tmp_path, builder, asynchronous):
+    """Calls to tools removed from the model surface are refused at execution time."""
+    _make_skill(
+        tmp_path,
+        "demo-skill",
+        [
+            "list_available_meeting_rooms",
+            "create_booking",
+            "cancel_booking",
+            "list_bookings",
+        ],
+    )
+    app_config = _make_app_config(tmp_path)
+    middlewares = _lead_middlewares(monkeypatch, app_config) if builder == "lead" else _subagent_middlewares(app_config)
+    slice_ = _skill_authority_slice(middlewares)
+
+    model = _scripted_model(call_device=True)
+    graph = create_agent(
+        model=model,
+        tools=[read_file, control_device],
+        middleware=slice_,
+        state_schema=ThreadState,
+    )
+
+    _DEVICE_CALLS.clear()
+    result, _journal = _invoke(graph, asynchronous=asynchronous)
+
+    assert _DEVICE_CALLS == []
+    blocked = [m for m in result["messages"] if isinstance(m, ToolMessage) and m.tool_call_id == "tool-call-1"]
+    assert len(blocked) == 1
+    assert blocked[0].status == "error"
+    assert "not allowed by the active skill policy" in blocked[0].content
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_skill_without_allowed_tools_does_not_filter(monkeypatch, tmp_path, asynchronous):
+    """Skills that omit allowed-tools keep the agent's full authorized tool set."""
+    _make_skill(tmp_path, "demo-skill", None)
+    app_config = _make_app_config(tmp_path)
+    middlewares = _lead_middlewares(monkeypatch, app_config)
+    slice_ = _skill_authority_slice(middlewares)
 
     model = _scripted_model()
     graph = create_agent(
@@ -245,23 +286,15 @@ def test_active_skill_allowed_tools_does_not_remove_authorized_tools(monkeypatch
     )
 
     _PARSE_CALLS.clear()
-    result, journal = _invoke(graph, asynchronous=asynchronous)
+    result, _journal = _invoke(graph, asynchronous=asynchronous)
 
     assert {"read_file", "parse_document", "write_file"} <= set(model.bound_tool_names[0])
     assert _PARSE_CALLS == ["report.pdf"]
-    assert _WRITE_CALLS == []
     assert result["messages"][-1].content == "done"
-    # The real slash activation still ran: usage was recorded for the skill.
-    assert [usage.get("name") for usage in journal.skill_usages if isinstance(usage, dict)] == ["demo-skill"]
 
 
 def test_allowed_tools_metadata_cannot_grant_rbac_denied_tool(monkeypatch, tmp_path):
-    """Declaring a tool in allowed-tools never bypasses genuine Agent authorization.
-
-    Control test: RBAC denies `write_file` for the guest role. A skill whose
-    allowed-tools lists `write_file` must not make it executable; the
-    Guardrail-backed authorization middleware still refuses the call.
-    """
+    """Declaring a tool in allowed-tools never bypasses genuine Agent authorization."""
     from deerflow.agents.middlewares.tool_error_handling_middleware import build_lead_runtime_middlewares
 
     provider = RbacAuthorizationProvider(roles={"guest": {"tools": {"allow": ["read_file", "parse_document"]}}})
@@ -322,6 +355,4 @@ def test_allowed_tools_metadata_cannot_grant_rbac_denied_tool(monkeypatch, tmp_p
     blocked = [message for message in result["messages"] if isinstance(message, ToolMessage) and message.tool_call_id == "denied-call"]
     assert len(blocked) == 1
     assert blocked[0].status == "error"
-    # The denial must be visible in the ToolMessage content itself, not only
-    # via the status error flag.
     assert "authz.denied" in blocked[0].content
